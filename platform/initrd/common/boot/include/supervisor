@@ -1,0 +1,1139 @@
+#!/bin/sh
+
+set -o pipefail
+is_restart_event=''
+
+srv_dir='/srv'
+volatile_dir='/var/run/supervisor'
+supervise_dir="$srv_dir/system/storage/supervisor"
+
+_perform_startup_checks()
+{
+  local rv='0'
+
+  for dir in /proc/self /sys/kernel; do
+    if [ ! -d "$dir" ]; then
+      warn "Unable to locate required directory '$dir'"
+      rv='1'
+    fi
+  done
+
+  if [ "$rv" -ne 0 ]; then
+    warn 'At least one required filesystem is not mounted'
+  fi
+
+  return "$rv"
+}
+
+_safe_waitpid()
+{
+  local pid="$1"
+
+  EINTR=0
+  wait "$pid"
+
+  local status="$?"
+
+  while [ "$EINTR" -gt 0 ]; do
+    EINTR=0
+    wait "$pid"
+    status="$?"
+  done
+
+  return "$status"
+} 
+
+_prepare_status_directory()
+{
+  local package="`basename -- "$1"`"
+
+  local pkg_volatile_dir="$volatile_dir/$package"
+  local pkg_status_dir="$supervise_dir/$package/status"
+
+  mkdir -p "$pkg_volatile_dir" "$pkg_status_dir/persistent" &&
+  ln -sf "$pkg_volatile_dir" "$pkg_status_dir/volatile"
+}
+
+# _supervisor_process:
+#   Entry point for the service supervision process.
+#   This reconfigures logging and must be run in a subshell.
+
+_supervisor_process()
+{
+  local package="`basename -- "$1"`"
+  local service="`basename -- "$2"`"
+
+  source '/boot/include/logger'
+  log="$supervise_dir/$package/logs/$service.log"
+
+  local pkg_status_dir="$supervise_dir/$package/status"
+
+  trap 'EINTR=1; _supervisor_resync_trap "$package" "$service"' HUP
+  trap 'EINTR=1; _supervisor_restart_trap "$package" "$service"' USR1
+  trap 'EINTR=1; _supervisor_termination_trap "$package" "$service"' TERM
+
+  mkdir -p "$supervise_dir/$package/logs"
+  log "Starting supervisor for '$package/$service'"
+
+  while true; do
+
+    # Is service down?
+    #   If so, block on the FIFO; a write is our signal to resume.
+
+    local svc_down_fifo="$pkg_status_dir/volatile/$service.down"
+
+    if [ -p "$svc_down_fifo" ]; then
+      read &>/dev/null < "$svc_down_fifo"
+      rm -f "$svc_down_fifo"
+    fi
+
+    # Accounting information:
+    #   This keeps track of service uptime, number of restarts, and
+    #   any other information that can help troubleshoot failures.
+
+    _supervisor_accounting_write "$package" "$service" 'restart' \
+      || log "Accounting write failure during '$package/$service' restart"
+
+    # Fork-and-exec:
+    #  This attempts to start the supervised process.
+
+    log "Starting run script for '$package/$service'"
+    (exec "$srv_dir/scripts/$package/run/$service" >> "$log" 2>&1) &
+
+    local pid="$!"
+    local pid_file="$pkg_status_dir/volatile/$service.pid"
+    local restart_file="$pkg_status_dir/volatile/$service.restart"
+
+    log "Started '$package/$service'; pid is '$pid'"
+
+    echo "$pid" > "$pid_file" \
+      || log "Failed to create '$pid_file'"
+
+    rm -f "$restart_file" \
+      || log "Failed to remove '$restart_file'"
+
+    _safe_waitpid "$pid"
+    local status="$?"
+
+    rm -f "$pid_file" \
+      || log "Failed to remove '$pid_file'"
+
+    # Process exit status:
+    #   Log status information, and wait to respawn if needed.
+
+    local wait_required=''
+
+    if [ "$status" -eq 0 ]; then
+      log "Service '$package/$service' (pid '$pid') exited normally"
+      wait_required='t'
+    else
+      log "Service '$package/$service'" \
+        "(pid '$pid') terminated with exit status '$status'"
+
+      if [ "$is_restart_event" ]; then
+        is_restart_event=''
+      else
+        _supervisor_accounting_write "$package" "$service" 'exit' \
+          || log "Accounting write failure during '$package/$service' exit"
+
+        wait_required='t'
+      fi
+    fi
+
+    if [ "$wait_required" ]; then
+      sleep 2
+    fi
+
+    # Restart:
+    #   Go around and restart the service.
+
+    rm -f "$svc_status_fifo"
+    log "Restarting service '$package/$service'"
+  done
+}
+
+_supervisor_record_uptime()
+{
+  local package="$1"
+  local service="$2"
+  local should_delete="$2"
+
+  local pkg_status_dir="$supervise_dir/$package/status"
+  local svc_restart_count="$pkg_status_dir/volatile/$service.count"
+
+  exit "$?"
+}
+
+_supervisor_termination_trap()
+{
+  local package="$1"
+  local service="$2"
+
+  log "Terminating supervisor for '$package/$service'"
+  _supervisor_terminate_service "$package" "$service"
+
+  exit "$?"
+}
+
+_supervisor_restart_trap()
+{
+  local package="$1"
+  local service="$2"
+
+  local pkg_status_dir="$supervise_dir/$package/status"
+  local restart_file="$pkg_status_dir/volatile/$service.restart"
+
+  touch "$restart_file"
+
+  is_restart_event='t'
+  _supervisor_terminate_service "$package" "$service"
+}
+
+_supervisor_resync_trap()
+{
+  local package="$1"
+  local service="$2"
+
+  local pkg_status_dir="$supervise_dir/$package/status"
+  local svc_down_fifo="$pkg_status_dir/volatile/$service.down"
+
+  log "Resynchronization triggered for '$package/$service'"
+
+  if supervisor_is_service_running "$package" "$service"; then
+
+    if [ -p "$svc_down_fifo" ]; then
+      log "Resynchronization is terminating '$package/$service'"
+      _supervisor_terminate_service "$package" "$service"
+    fi
+
+  fi
+
+  return 0
+}
+
+_start_supervisor_process()
+{
+  local package="$1"
+  local service="$2"
+
+  local pkg_status_dir="$supervise_dir/$package/status"
+  local ppid_file="$pkg_status_dir/volatile/$service.ppid"
+
+  if supervisor_is_service_watched "$package" "$service"; then
+    warn "Supervisor already running for '$package/$service'"
+    return 0
+  fi
+
+  _prepare_status_directory "$package" || return 1
+  supervisor_service_exists "$package" "$service" || return 2
+
+  for ext in generation timestamp; do
+    rm -f "$pkg_status_dir/volatile/$service.$ext" || return 3
+  done
+
+  # Start supervisor:
+  #   This actually starts the supervisor process; it, in
+  #   turn, forks off the actual service to-be-watched.
+
+  (_supervisor_process "$package" "$service") &
+
+  # Write PPID file:
+  #   This file contains the PID of the supervisor process.
+
+  local ppid="$!"
+  echo "$ppid" > "$ppid_file"
+
+  if [ "$?" -ne 0 ]; then
+    warn "Failed to create PID file for '$package/$service'"
+    warn "Terminating supervisor process '$pid'"
+
+    kill -KILL "$ppid"
+    return 4
+  fi
+
+  info "Service '$package/$service' started successfully"
+  return 0
+}
+
+_create_service_termination_fifo()
+{
+  local package="$1"
+  local service="$2"
+
+  # Termination-status FIFO:
+  #   This is used to wait for service termination, as well as
+  #   to relay status messages during the termination process.
+
+  local pkg_status_dir="$supervise_dir/$package/status"
+  local svc_term_fifo="$pkg_status_dir/volatile/$service.term"
+
+  if ! mkfifo -m 0640 "$svc_term_fifo"; then
+    warn "Failed to create termination FIFO for '$package/$service'"
+    return 1
+  fi
+
+  return 0
+}
+
+_delete_service_termination_fifo()
+{ 
+  local package="$1"
+  local service="$2"
+
+  local pkg_status_dir="$supervise_dir/$package/status"
+  local svc_term_fifo="$pkg_status_dir/volatile/$service.term"
+
+  if ! rm -f "$svc_term_fifo"; then
+    warn "Failed to delete termination FIFO for '$package/$service'"
+    return 1
+  fi
+
+  return 0
+}
+
+_wait_for_service_termination()
+{
+  local package="$1"
+  local service="$2"
+
+  local exit_status=''
+  local pkg_status_dir="$supervise_dir/$package/status"
+  local svc_term_fifo="$pkg_status_dir/volatile/$service.term"
+
+  while [ -z "$exit_status" ] ; do
+    while read line; do
+
+      # Did we read a number?
+      #   If so, this is the supervisor's exit status.
+
+      if is_integer "$line"; then
+        exit_status="$line"
+        break;
+      fi
+
+      # Did we read something else?
+      #   If so, this is a status message; print it as a warning.
+
+      warn "$line"
+
+    done < "$svc_term_fifo"
+  done
+
+  if [ "$exit_status" -ne 0 ]; then
+    log "Service '$package/$service' exited with status $exit_status"
+  fi
+
+  return 0
+}
+
+_pid_has_active_process()
+{
+  local pid="`basename -- "$1"`"
+
+  test -d "/proc/$pid"
+  return "$?"
+}
+
+_pidfile_has_active_process()
+{
+  local pid_file="$1"
+
+  if ! [ -f "$pid_file" ]; then
+    return 2
+  fi
+
+  local pid="`cat "$pid_file" 2>/dev/null`"
+
+  if ! [ "$pid" ]; then
+    return 3
+  fi
+
+  _pid_has_active_process "$pid"
+  return "$?"
+}
+
+_termination_status_send()
+{
+  local package="$1"
+  local service="$2"
+  shift 2
+
+  local pkg_status_dir="$supervise_dir/$package/status"
+  local svc_term_fifo="$pkg_status_dir/volatile/$service.term"
+
+  for str in "$@"; do
+    if [ -p "$svc_term_fifo" ]; then
+      echo "$str" > "$svc_term_fifo"
+    else
+      if [ "$str" -ge 0 ] 2>/dev/null; then
+        str="Service exited with status '$str'"
+      fi
+      log "'$package/$service': $str"
+    fi
+  done
+
+  return "$?"
+}
+
+_terminate_supervisor_process()
+{
+  local package="$1"
+  local service="$2"
+
+  supervisor_service_exists "$package" "$service" || return 1
+
+  if ! supervisor_is_service_watched "$package" "$service"; then
+    warn "Supervisor not running for '$package/$service'"
+    return 0
+  fi
+
+  local pkg_status_dir="$supervise_dir/$package/status"
+  local ppid_file="$pkg_status_dir/volatile/$service.ppid"
+
+  local ppid="`cat "$ppid_file" 2>/dev/null`"
+
+  if ! [ "$ppid" ]; then
+    return 2
+  fi
+
+  _create_service_termination_fifo "$package" "$service" \
+    || return 3
+
+  rm -f "$ppid_file" "$pkg_status_dir/volatile/$service.down" &&
+  kill -TERM "$ppid" 2>/dev/null
+
+  if [ "$?" -ne 0 ]; then
+    warn "Couldn't send signal to supervisor of '$package/$service'"
+    return 4
+  fi
+
+  _wait_for_service_termination "$package" "$service" \
+    || return 5
+
+  _delete_service_termination_fifo "$package" "$service" \
+    || return 6
+
+  _supervisor_accounting_write "$package" "$service" 'exit' \
+    || log "Accounting write failure during '$package/$service' exit"
+
+  info "Service '$package/$service' stopped successfully"
+  return 0
+}
+
+_supervisor_terminate_service()
+{
+  local package="$1"
+  local service="$2"
+
+  local max_terminate_attempts='10'
+  local termination_wait_interval='2'
+  local termination_status_threshold='5'
+
+  local pkg_status_dir="$supervise_dir/$package/status"
+  local pid_file="$pkg_status_dir/volatile/$service.pid"
+
+  if ! _pidfile_has_active_process "$pid_file"; then
+    _termination_status_send "$package" "$service" '0'
+    return 0
+  fi
+
+  local pid="`cat "$pid_file" 2>/dev/null`"
+  local rv="$?"
+
+  if [ "$rv" -ne 0 -o -z "$pid" ]; then
+
+    _termination_status_send "$package" "$service" \
+      "Failure while trying to read the PID file '$pid_file'"
+
+    _termination_status_send "$package" "$service" '254'
+    return 254
+  fi
+
+  if ! rm -f "$pid_file"; then
+
+    _termination_status_send "$package" "$service" \
+      "Failed to remove the PID file '$pid_file'" \
+      'Ensure you have write access to package status directories'
+
+    _termination_status_send "$package" "$service" '253'
+    return 253
+  fi
+
+  for i in `seq 1 "$max_terminate_attempts"`; do
+
+    kill -TERM "$pid" 2>/dev/null
+
+    if ! _pid_has_active_process "$pid"; then
+      break;
+    else
+      if [ "$i" -gt "$termination_status_threshold" ]; then
+        _termination_status_send "$package" "$service" \
+          "Service '$package/$service' remains running; retrying"
+      fi
+      sleep "$termination_wait_interval"
+    fi
+  done
+
+  if _pid_has_active_process "$pid"; then
+
+    _termination_status_send "$package" "$service" \
+      "Process in package '$package/$service' did not terminate" \
+      "Forcibly killing process with PID '$pid'..."
+
+    kill -KILL "$pid" 2>/dev/null
+    sleep "$termination_wait_interval"
+  fi
+
+  wait "$pid"
+  local exit_status="$?"
+
+  _termination_status_send "$package" "$service" "$exit_status"
+  return "$exit_status"
+}
+
+_supervisor_apply()
+{
+  local operation="$1"
+  local function="$2"
+  local package="$3"
+
+  shift 3
+
+  local rv='0'
+  local services="$@"
+
+  if ! supervisor_package_exists "$package"; then
+    warn "Package '$package' does not appear to be installed"
+    return 255
+  fi
+
+  supervisor_package_exists "$package" || return 254
+
+  if [ "$#" -le 0 ]; then
+    services="$srv_dir/scripts/$package/run"/*
+  fi
+
+  for service in $services; do
+
+    local service="`basename -- "$service"`"
+
+    if [ "$#" -le 0 -a "$service" = '*' ]; then
+      log "No services present for package '$package'"
+      return 253
+    fi
+
+    supervisor_service_exists "$package" "$service" || return 252
+
+    if supervisor_is_service_disabled "$package" "$service"; then
+      warn "Service '$package/$service' is disabled; skipping"
+      continue
+    fi
+
+    "$function" "$package" "$service"
+
+    if [ "$?" -ne 0 ]; then
+      rv="$(($rv + 1))"
+      warn "Failed to $operation supervisor for '$package/$service'"
+    fi
+  done
+
+  return "$rv"
+}
+
+_supervisor_accounting_write()
+{
+  local package="$1"
+  local service="$2"
+  local action_name="$3"
+
+  local pkg_status_dir="$supervise_dir/$package/status"
+  local svc_status_base="$pkg_status_dir/volatile/$service"
+
+  case "$action_name" in
+    'exit')
+      rm -f "$svc_status_base.timestamp" \
+        || return 1
+      ;;
+    'restart')
+      date +'%s' > "$svc_status_base.timestamp" \
+        || return 2
+
+      local file="$svc_status_base.generation"
+      local generation="`read_integer_file "$file" 't'`" \
+        || return 3
+
+      [ -z "$generation" ] && generation='0'
+      echo "$(($generation + 1))" > "$file"
+      ;;
+    *)
+      return 255
+      ;;
+  esac
+
+  return "$?"
+}
+
+supervisor_init()
+{
+  if ! _perform_startup_checks; then
+    fatal 'Startup checks failed for supervisor library'
+  fi
+
+  return 0
+}
+
+supervisor_accounting_read()
+{
+  local package="$1"
+  local service="$2"
+  local attribute_name="$3"
+
+  local pkg_status_dir="$supervise_dir/$package/status"
+  local svc_status_base="$pkg_status_dir/volatile/$service"
+
+  case "$attribute_name" in
+    'timestamp')
+      read_integer_file "$svc_status_base.timestamp" 't'
+      ;;
+    'generation')
+      read_integer_file "$svc_status_base.generation" 't'
+      ;;
+    'uptime')
+      local now="`date +'%s'`" || return 1
+      local start="`read_integer_file "$svc_status_base.timestamp" 't'`" \
+        || return 2
+
+      [ -z "$start" ] && local start="$now"
+      echo "$((now - start))"
+      ;;
+    *)
+      return 255
+      ;;
+  esac
+
+  return "$?"
+}
+
+supervisor_start()
+{
+  local package="`basename -- "$1"`"
+  shift 1
+
+  _supervisor_apply 'start' _start_supervisor_process "$package" "$@"
+  return "$?"
+}
+
+supervisor_stop()
+{
+  local package="`basename -- "$1"`"
+  shift 1
+
+  _supervisor_apply 'stop' _terminate_supervisor_process "$package" "$@"
+  return "$?"
+}
+
+supervisor_reset()
+{
+  if [ -d "$supervise_dir" ]; then
+    for p in '*.down' '*.term'; do
+      find "$supervise_dir" -type p -name "$p" -exec rm -f {} \; \
+        || return 1
+    done
+    for f in '*.pid' '*.ppid'; do
+      find "$supervise_dir" -type f -name "$f" -exec rm -f {} \; \
+        || return 2
+    done
+  fi
+
+  return 0
+}
+
+supervisor_service_disable()
+{
+  local package="`basename -- "$1"`"
+  local service="`basename -- "$2"`"
+
+  supervisor_service_exists "$package" "$service" || return 1
+
+  if supervisor_is_service_disabled "$package" "$service"; then
+    warn "Service '$package/$service' is already disabled"
+    return 2
+  fi
+
+  if supervisor_is_service_watched "$package" "$service"; then
+    if ! supervisor_stop "$package" "$service"; then
+      warn "Failed to stop supervisor for '$package/$service'"
+      return 3
+    fi
+  fi
+
+  local pkg_status_dir="$supervise_dir/$package/status"
+  touch "$pkg_status_dir/persistent/$service.disabled"
+
+  return 0
+}
+
+supervisor_service_enable()
+{
+  local package="`basename -- "$1"`"
+  local service="`basename -- "$2"`"
+
+  supervisor_service_exists "$package" "$service" || return 1
+
+  if ! supervisor_is_service_disabled "$package" "$service"; then
+    warn "Service '$package/$service' is already enabled"
+    return 2
+  fi
+
+  local pkg_status_dir="$supervise_dir/$package/status"
+  rm -f "$pkg_status_dir/persistent/$service.disabled"
+
+  if ! supervisor_start "$package" "$service"; then
+    warn "Failed to start supervisor for '$package/$service'"
+    return 3
+  fi
+
+  return 0
+}
+
+supervisor_service_down()
+{
+  local package="`basename -- "$1"`"
+  local service="`basename -- "$2"`"
+
+  supervisor_service_exists "$package" "$service" || return 1
+
+  if ! supervisor_is_service_watched "$package" "$service"; then
+    warn "Supervisor is not running for '$package/$service'"
+    return 2
+  fi
+
+  if supervisor_is_service_down "$package" "$service"; then
+    warn "Service '$package/$service' is already down"
+    return 3
+  fi
+
+  _create_service_termination_fifo "$package" "$service" \
+    || return 4
+
+  local pkg_status_dir="$supervise_dir/$package/status"
+  local pid_file="$pkg_status_dir/volatile/$service.pid"
+  local svc_down_fifo="$pkg_status_dir/volatile/$service.down"
+  local ppid="`cat "$pkg_status_dir/volatile/$service.ppid" 2>/dev/null`"
+
+  rm -f "$svc_down_fifo" &&
+  mkfifo -m 0600 "$svc_down_fifo" &&
+  kill -HUP "$ppid" 2>/dev/null || return 5
+
+  if _pidfile_has_active_process "$pid_file"; then
+    _wait_for_service_termination "$package" "$service" \
+      || return 6
+  fi
+
+  _delete_service_termination_fifo "$package" "$service" \
+    || return 7
+
+  return 0
+}
+
+supervisor_service_up()
+{
+  local package="`basename -- "$1"`"
+  local service="`basename -- "$2"`"
+
+  supervisor_service_exists "$package" "$service" || return 1
+
+  if supervisor_is_service_disabled "$package" "$service"; then
+    warn "Service '$package/$service' is currently disabled"
+    return 2
+  fi
+
+  if ! supervisor_is_service_watched "$package" "$service"; then
+    warn "Supervisor is not running for '$package/$service'"
+    return 3
+  fi
+
+  if ! supervisor_is_service_down "$package" "$service"; then
+    warn "Service '$package/$service' is already running"
+    return 4
+  fi
+
+  # Write to the FIFO:
+  #   This unblocks `_supervisor_process` and starts the service.
+  #   If, for some reason, the supervisor isn't listening at the
+  #   other end, we'll remain blocked until a supervisor shows up.
+
+  local pkg_status_dir="$supervise_dir/$package/status"
+  local svc_down_fifo="$pkg_status_dir/volatile/$service.down"
+
+  echo '1' > "$svc_down_fifo" || return 5
+  return 0
+}
+
+supervisor_service_restart()
+{
+  local package="`basename -- "$1"`"
+  local service="`basename -- "$2"`"
+
+  supervisor_service_exists "$package" "$service" || return 1
+
+  if supervisor_is_service_disabled "$package" "$service"; then
+    warn "Service '$package/$service' is currently disabled"
+    return 2
+  fi
+
+  if ! supervisor_is_service_watched "$package" "$service"; then
+    warn "Supervisor is not running for '$package/$service'"
+    return 3
+  fi
+
+  if supervisor_is_service_down "$package" "$service"; then
+    warn "Service '$package/$service' is down"
+    return 4
+  fi
+
+  if ! supervisor_is_service_running "$package" "$service"; then
+    warn "Service '$package/$service' is not currently running"
+    return 5
+  fi
+
+  _create_service_termination_fifo "$package" "$service" \
+    || return 6
+
+  local pkg_status_dir="$supervise_dir/$package/status"
+  local ppid="`cat "$pkg_status_dir/volatile/$service.ppid" 2>/dev/null`"
+
+  kill -USR1 "$ppid" 2>/dev/null || return 7
+
+  _wait_for_service_termination "$package" "$service" \
+    || return 8
+
+  _delete_service_termination_fifo "$package" "$service" \
+    || return 9
+
+  return 0
+}
+
+supervisor_service_reload()
+{
+  local package="`basename -- "$1"`"
+  local service="$2"
+
+  supervisor_service_exists "$package" "$service" || return 1
+
+  if ! supervisor_is_service_running "$package" "$service"; then
+    warn "Service '$package/$service' is not currently running"
+    return 2
+  fi
+
+  local pkg_status_dir="$supervise_dir/$package/status"
+  local pid="`cat "$pkg_status_dir/volatile/$service.pid" 2>/dev/null`"
+
+  kill -HUP "$pid" 2>/dev/null || return 3
+  return 0
+}
+
+supervisor_list_all_packages()
+{
+  for package in "$srv_dir/scripts"/*; do
+    package="`basename -- "$package"`"
+    if [ "$package" != '*' -a "$package" != 'system' ]; then
+      echo "$package"
+    fi
+  done
+
+  return 0
+}
+
+supervisor_list_all_services()
+{
+  local package="`basename -- "$1"`"
+
+  supervisor_package_exists "$package" || return 1
+
+  for service in "$srv_dir/scripts/$package/run"/*; do
+    service="`basename -- "$service"`"
+    if [ "$service" != '*' ]; then
+      echo "$service"
+    fi
+  done
+
+  return 0
+}
+
+supervisor_list_services_filtered()
+{
+  local package="`basename -- "$1"`"
+  shift 1
+
+  supervisor_list_all_services "$package" | while read service; do
+    if "$@" "$package" "$service"; then
+      echo "$service"
+    fi
+  done
+
+  return 0
+}
+
+supervisor_list_restarting_services()
+{
+  local package="`basename -- "$1"`"
+
+  supervisor_list_services_filtered \
+    "$package" supervisor_is_service_restarting
+}
+
+supervisor_list_enabled_services()
+{
+  local package="`basename -- "$1"`"
+
+  supervisor_list_services_filtered \
+    "$package" supervisor_is_service_enabled
+}
+
+supervisor_list_disabled_services()
+{
+  local package="`basename -- "$1"`"
+
+  supervisor_list_services_filtered \
+    "$package" supervisor_is_service_disabled
+}
+
+supervisor_list_watched_services()
+{
+  local package="`basename -- "$1"`"
+
+  # List watched services:
+  #   These are services that have a supervisor running.
+
+  local pkg_status_dir="$supervise_dir/$package/status"
+
+  for service in "$pkg_status_dir/volatile"/*.ppid; do
+    service="`basename -- "$service" .ppid`"
+    if [ "$service" != '*' ]; then
+      if supervisor_is_service_watched "$package" "$service"; then
+        echo "$service"
+      fi
+    fi
+  done
+
+  return 0
+}
+
+supervisor_list_running_services()
+{
+  local package="`basename -- "$1"`"
+
+  # List running services:
+  #   These are services with an actual running process.
+
+  local pkg_status_dir="$supervise_dir/$package/status"
+
+  for service in "$pkg_status_dir/volatile"/*.pid; do
+    service="`basename -- "$service" .pid`"
+    if [ "$service" != '*' ]; then
+      if supervisor_is_service_running "$package" "$service"; then
+        echo "$service"
+      fi
+    fi
+  done
+
+  return 0
+}
+
+supervisor_list_down_services()
+{
+  local package="`basename -- "$1"`"
+
+  supervisor_list_services_filtered \
+    "$package" supervisor_is_service_down
+}
+
+supervisor_list_expected_services()
+{
+  local package="`basename -- "$1"`"
+
+  supervisor_list_services_filtered \
+    "$package" supervisor_is_service_expected
+}
+
+supervisor_list_unexpected_services()
+{
+  local package="`basename -- "$1"`"
+
+  supervisor_list_services_filtered \
+    "$package" supervisor_is_service_unexpected
+}
+
+supervisor_is_service_restarting()
+{
+  local package="`basename -- "$1"`"
+  local service="`basename -- "$2"`"
+
+  local pkg_status_dir="$supervise_dir/$package/status"
+  test -f "$pkg_status_dir/volatile/$service.restart"
+}
+
+supervisor_is_service_disabled()
+{
+  local package="`basename -- "$1"`"
+  local service="`basename -- "$2"`"
+
+  local pkg_status_dir="$supervise_dir/$package/status"
+  test -f "$pkg_status_dir/persistent/$service.disabled"
+}
+
+supervisor_is_service_enabled()
+{
+  ! supervisor_is_service_disabled "$@"  
+}
+
+supervisor_is_service_watched()
+{
+  local package="`basename -- "$1"`"
+  local service="`basename -- "$2"`"
+
+  local pkg_status_dir="$supervise_dir/$package/status"
+  _pidfile_has_active_process "$pkg_status_dir/volatile/$service.ppid"
+}
+
+supervisor_is_service_running()
+{
+  local package="`basename -- "$1"`"
+  local service="`basename -- "$2"`"
+
+  local pkg_status_dir="$supervise_dir/$package/status"
+  _pidfile_has_active_process "$pkg_status_dir/volatile/$service.pid"
+}
+
+supervisor_is_service_down()
+{
+  local package="`basename -- "$1"`"
+  local service="`basename -- "$2"`"
+
+  local pkg_status_dir="$supervise_dir/$package/status"
+  test -p "$pkg_status_dir/volatile/$service.down"
+}
+
+supervisor_is_service_expected()
+{
+  supervisor_service_exists "$@" || return 1
+  supervisor_is_service_down "$@" && return 2
+  supervisor_is_service_disabled "$@" && return 3
+  supervisor_is_service_restarting "$@" && return 4
+
+  return 0
+}
+
+supervisor_is_service_unexpected()
+{
+  ! supervisor_is_service_expected "$@"
+}
+
+supervisor_package_exists()
+{
+  local package="`basename -- "$1"`"
+
+  if ! [ -d "$srv_dir/scripts/$package" ]; then
+    warn "Package '$package' does not exist"
+    return 1
+  fi
+
+  return 0
+}
+
+supervisor_service_exists()
+{
+  local package="`basename -- "$1"`"
+  local service="`basename -- "$2"`"
+
+  if ! [ -x "$srv_dir/scripts/$package/run/$service" ]; then
+    warn "Service '$package/$service' does not exist"
+    return 1
+  fi
+
+  return 0
+}
+
+supervisor_service_pid()
+{
+  local package="`basename -- "$1"`"
+  local service="`basename -- "$2"`"
+
+  local pkg_status_dir="$supervise_dir/$package/status"
+  local pid="`cat "$pkg_status_dir/volatile/$service.pid" 2>/dev/null`"
+
+  _pid_has_active_process "$pid" && echo "$pid"
+}
+
+supervisor_service_ppid()
+{
+  local package="`basename -- "$1"`"
+  local service="`basename -- "$2"`"
+
+  local pkg_status_dir="$supervise_dir/$package/status"
+  local ppid="`cat "$pkg_status_dir/volatile/$service.ppid" 2>/dev/null`"
+
+  _pid_has_active_process "$ppid" && echo "$ppid"
+}
+
+supervisor_print_service_status()
+{
+  local package="`basename -- "$1"`"
+  local service="`basename -- "$2"`"
+
+  echo "  Service '$service':"
+  echo -n '    Status: '
+
+  # Service Status
+  if supervisor_is_service_running "$package" "$service"; then
+    echo 'Up'
+  elif supervisor_is_service_disabled "$package" "$service"; then
+    echo 'Disabled'
+  elif supervisor_is_service_down "$package" "$service"; then
+    echo 'Down'
+  elif supervisor_is_service_restarting "$package" "$service"; then
+    echo 'Restarting'
+  elif ! supervisor_is_service_watched "$package" "$service"; then
+    echo 'Unsupervised'
+  else
+    echo 'Failure'
+  fi
+
+  # Accounting Information
+  local uptime="`
+    supervisor_accounting_read "$package" "$service" 'uptime'
+  `"
+  local generation="`
+    supervisor_accounting_read "$package" "$service" 'generation'
+  `"
+  local service_pid="`
+    supervisor_service_pid "$package" "$service"
+  `"
+  local supervisor_pid="`
+    supervisor_service_ppid "$package" "$service"
+  `"
+
+  echo -n '    '
+  echo "Up: $uptime seconds, Restarts: $(($generation - 1))"
+
+  # Attributes
+  echo -n '    '
+  echo -n 'Attributes: '
+
+  for attribute in $attributes; do
+    if "supervisor_is_service_$attribute" "$package" "$service"; then
+      echo -n "$attribute "
+    fi
+  done | sed 's/ \([^$]\)/, \1/g; s/ $//;'
+
+  echo
+
+  # Process Identifiers
+  [ -z "$service_pid" ] && service_pid='None'
+  [ -z "$supervisor_pid" ] && supervisor_pid='None'
+
+  echo -n '    '
+  echo "Service PID: $service_pid, Supervisor PID: $supervisor_pid"
+}
+

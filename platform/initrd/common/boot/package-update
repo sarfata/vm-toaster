@@ -1,0 +1,38 @@
+#!/bin/sh
+
+source '/boot/include/utility'
+source '/boot/include/package'
+
+main()
+{
+  local force_install=''
+
+  if [ "$1" = '-f' -o "$1" = '--force' ]; then
+    force_install='t'
+    shift 1
+  fi
+
+  if [ $# -le 0 -o "$1" = '-h' -o "$1" = '--help' ]; then
+    usage
+  fi
+
+  require_root
+
+  for package in "$@"; do
+    package_update "$package" "$force_install" \
+      || fatal "Failed to update package '$package'"
+  done
+
+  success 'All specified packages have been updated'
+  return 0
+}
+
+usage()
+{
+  echo "Usage: $0 [-f|--force] <package.vpkg>..." >&2
+  exit 111
+}
+
+main "$@"
+exit "$?"
+

@@ -1,0 +1,32 @@
+#!/bin/sh
+
+[ -f /proc/cmdline ] || /bin/mount /proc &>/dev/null
+
+/bin/mount -o remount,rw /
+/bin/mount -o rw /dev
+
+mkdir -p /dev/pts /dev/shm
+/bin/mount -a 
+
+source /etc/init.d/rc.font
+source /etc/init.d/rc.ulimit
+
+/sbin/udevd --daemon &>/dev/null
+/sbin/udevadm trigger --action=add &>/dev/null &
+
+modprobe loop 2>/dev/null
+
+/sbin/ifconfig lo 127.0.0.1 up
+/sbin/route add 127.0.0.1 lo
+
+/sbin/ldconfig 2>/dev/null
+/etc/init.d/rc.dhcpcd &
+
+chown -R vm:root /home/vm
+chown root:root / && chmod 0755 /
+
+/usr/bin/sethostname "`cat /etc/hostname`"
+sysctl -w kernel.grsecurity.grsec_lock=1 &>/dev/null
+
+exec /boot/system-start
+

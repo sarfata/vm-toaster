@@ -1,0 +1,36 @@
+#!/bin/sh
+
+find_ntp_server()
+{
+  echo 'pool.ntp.org'
+}
+
+detect_vmware()
+{
+  dmesg | grep -i '^DMI: VMware' &>/dev/null
+  return "$?"
+}
+
+start()
+{
+  local self="`realpath "$0"`"
+  local base="`dirname -- "$self"`"
+
+  source "$base/../env" &&
+  merge_environment /srv || return 255
+
+  if ! detect_vmware; then
+    exec nohup ntpd -ndp "`find_ntp_server`" \
+      >> "$PACKAGE_STORAGE/ntpd/logs/startup.log" 2>&1
+  fi
+
+  modprobe -a \
+    vmci vsock vmxnet vmxnet3 vmhgfs vmblock vmsync &&
+  \
+  exec vmtoolsd \
+    >> "$PACKAGE_STORAGE/vmtoolsd/logs/startup.log" 2>&1
+}
+
+start
+exit "$?"
+

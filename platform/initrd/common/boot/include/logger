@@ -1,0 +1,25 @@
+#!/bin/sh
+
+source '/boot/include/hypervisor'
+hypervisor_init
+
+verbose='t'
+log='/var/log/startup.log'
+
+emit()
+{
+  echo -e "`date +'[%Y/%m/%d %H:%M:%S]'` $*" \
+    >> "$log" 2>&1
+}
+
+print()
+{
+  if [ "`hypervisor_type`" = 'xen' ]; then
+    echo -e "$*" &>/dev/hvc0
+  else
+    echo -e "$*" >&2
+  fi
+
+  return "$?"
+}
+

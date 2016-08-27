@@ -1,0 +1,35 @@
+#!/bin/sh
+
+source '/boot/include/utility'
+source '/boot/include/package'
+source '/boot/include/supervisor'
+
+main()
+{
+  if [ $# -le 0 -o "$1" = '-h' -o "$1" = '--help' ]; then
+    usage
+  fi
+
+  require_root
+  supervisor_init
+
+  for package in "$@"; do
+    package_remove "$package" \
+      || fatal "Failed to remove package '$package'"
+
+    info "Package '$package' successfully removed"
+  done
+
+  success 'All specified packages have been removed'
+  return 0
+}
+
+usage()
+{
+  echo "Usage: $0 <package-name>..." >&2
+  exit 111
+}
+
+main "$@"
+exit "$?"
+

@@ -1,0 +1,69 @@
+#!/bin/sh
+
+source '/boot/include/utility'
+source '/boot/include/supervisor'
+
+reload()
+{
+  local package="$1"
+  local service="$2"
+
+  # Sanity check:
+  #   Make sure the service we're trying to reload actually exists.
+
+  if ! supervisor_service_exists "$package" "$service"; then
+    return 1
+  fi
+
+  supervisor_service_reload "$package" "$service" \
+    || fatal "Failed to reload configuration for '$package/$service'"
+
+  info "Service '$package/$service' reloaded successfully"
+  return 0
+}
+
+
+main()
+{
+  if [ "$#" -le 0 -o "$1" = '-h' -o "$1" = '--help' ]; then
+    usage
+  fi
+
+  local package="$1"
+  shift 1
+  
+  require_root
+  supervisor_init
+
+  local rv=''
+
+  if [ "$#" -le 0 ]; then
+    supervisor_list_expected_services "$package" | while read service; do
+      reload "$package" "$service"
+      local r="$?"; [ "$r" -eq 0 ] || exit "$r"
+    done
+    rv="$?"
+  else
+    for service in "$@"; do
+      reload "$package" "$service"
+      rv="$?"
+    done
+  fi
+ 
+  if [ "$rv" -ne 0 ]; then
+    fatal "Failed to reload one or more services in package '$package'"
+  fi
+
+  success "Finished reloading services in package '$package'"
+  return 0
+}
+
+usage()
+{
+  echo "Usage: $0 <package-name> <service-name>..."
+  exit 111
+}
+
+main "$@"
+exit "$?"
+

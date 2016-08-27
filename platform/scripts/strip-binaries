@@ -1,0 +1,37 @@
+#!/bin/bash
+
+set -o pipefail
+
+fatal()
+{
+  echo "Fatal: $*" >&2
+  exit 111
+}
+
+main()
+{
+  if [ $# -le 0 ]; then
+    usage
+  fi
+
+  for type in 'executable' 'shared object'; do
+    find "$@" -type f | xargs file \
+      | grep -F "$type" | grep ELF | cut -f1 -d: | \
+        while read file; do
+          strip --strip-unneeded "$file" \
+            || fatal "Failure while stripping '$file'"
+        done
+  done
+
+  return 0
+}
+
+usage()
+{
+  echo "Usage: `basename $0` base_directory..." >&2
+  exit 111
+}
+
+main "$@"
+exit "$?"
+

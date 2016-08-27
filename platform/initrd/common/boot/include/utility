@@ -1,0 +1,154 @@
+#!/bin/sh
+
+srv_dir='/srv'
+
+is_integer()
+{
+  for n in "$@"; do
+    [ "$n" -eq "$n" ] 2>/dev/null || return 1
+  done
+
+  return 0
+}
+
+underline()
+{
+  local string="$1"
+  local fill_character="$2"
+
+  if [ -z "$fill_character" ]; then
+    fill_character='-'
+  fi
+
+  echo "$string" | sed "s/./$fill_character/g;"
+}
+
+indent()
+{
+  local indent_string="$1"
+  shift 1
+
+  if [ -z "$indent_string" ]; then
+    indent_string='    '
+  fi
+
+  sed "s/^/$indent_string/;"
+}
+
+read_integer_file()
+{
+  local file="$1"
+  local allow_empty="$2"
+
+  local content="`cat "$file" 2>/dev/null`" \
+    || return 1
+
+  if [ "$allow_empty" -a -z "$content" ]; then
+    return 0
+  elif is_integer "$content"; then
+    echo "$content" && return 0
+  fi
+
+  return 255
+}
+
+require_root()
+{
+  if [ "`id -u`" -ne 0 ]; then
+    fatal 'You must be root to use this command'
+  fi
+}
+
+prepend_paths()
+{
+  for dir in "$@"; do
+    local bin="$dir/bin"
+    local lib="$dir/lib"
+    local pkg="$dir/lib/pkgconfig"
+    export PATH="$bin${PATH:+:}$PATH"
+    export PKG_CONFIG_PATH="$pkg${PKG_CONFIG_PATH:+:}$PKG_CONFIG_PATH"
+    export LD_LIBRARY_PATH="$lib${LD_LIBRARY_PATH:+:}$LD_LIBRARY_PATH"
+    export DYLD_LIBRARY_PATH="$lib${DYLD_LIBRARY_PATH:+:}$DYLD_LIBRARY_PATH"
+  done
+}
+
+append_paths()
+{
+  for dir in "$@"; do
+    local bin="$dir/bin"
+    local lib="$dir/lib"
+    local pkg="$dir/lib/pkgconfig"
+    export PATH="$PATH${PATH:+:}$bin"
+    export PKG_CONFIG_PATH="$PKG_CONFIG_PATH${PKG_CONFIG_PATH:+:}$pkg"
+    export LD_LIBRARY_PATH="$LD_LIBRARY_PATH${LD_LIBRARY_PATH:+:}$lib"
+    export DYLD_LIBRARY_PATH="$DYLD_LIBRARY_PATH${DYLD_LIBRARY_PATH:+:}$lib"
+  done
+}
+
+use_package()
+{
+  local package="$1"
+  local prepend="$2"
+
+  if [ "$prepend" ]; then
+    local command='prepend_paths'
+  else
+    local command='append_paths'
+  fi
+
+  $command "$srv_dir/software/$package/current/default"
+}
+
+# Logging:
+#   Provide a number of different log targets. The `emit`
+#   function is for raw not-necessarily-visual output, and
+#   the `print` function is for raw visual output. The `info`,
+#   `warn`, and `fatal` functions are higher-level exported
+#   logging functions that should be used by client code.
+#   The `log` method is an invisible-by-default debug target.
+#   Any of these functions can be overridden post-inclusion.
+
+emit()
+{
+  echo "$@" >&2
+}
+
+print()
+{
+  emit "$@"
+}
+
+success()
+{
+  emit "Success: $*"
+}
+
+info()
+{
+  emit "Info: $*"
+}
+
+warn()
+{
+  emit "Warning: $*"
+}
+
+fatal()
+{
+  print "Fatal: $*"
+  exit 1
+}
+
+log()
+{
+  if [ "$verbose" ]; then
+    emit "Debug: $*"
+  fi
+}
+
+if [ "$verbose" ]; then
+  log='/dev/stderr'
+else
+  log='/dev/null'
+fi
+

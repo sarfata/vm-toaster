@@ -1,92 +1,92 @@
 
+# Variables
+
 MAKE ?= make
+SHELL := /bin/bash
 QMAKE := ${MAKE} --no-print-directory
 
 
-all: packages iso-image
+# Public targets
 
-compile:
-	@(cd source && ${QMAKE})
+all: require-root download build
 
-copy:
-	@(cd source && ${QMAKE} copy)
+build: reset-time prepare-tree
+	@echo >&2
+	@echo "`tput bold`Building packages`tput sgr0`" >&2 && echo >&2
+	@(cd platform && \
+	  export HOME="`readlink -f ../.. 2>/dev/null || realpath ../..`" && \
+	  source ./.profile && ${QMAKE} compile all)
 
-packages: strip-binaries medic-core-pkg concierge-pkg java-pkg system-services-pkg vm-tools-pkg gardener-pkg
+repackage: reset-time prepare-tree
+	@(cd platform/source && \
+	  ${QMAKE} preload-medic-core) && \
+	(cd platform && \
+	  ${QMAKE} clean &>/dev/null && \
+	  ${QMAKE} rebuild-kernel copy all)
 
-clean:
-	rm -f output/image.iso
-	rm -rf staging/packages
+clean: require-root
+	@shopt -u xpg_echo && \
+	echo -n 'Cleaning source tree... ' && \
+	(cd platform && ${QMAKE} distclean) &>/dev/null && \
+	echo 'done.'
 
-distclean: clean
-	rm -rf initrd/lib/modules/*
-	rm -f iso/boot/kernel iso/boot/image.gz iso/packages/*
-	(cd source && ${MAKE} clean)
+distclean: require-root clean-initrd clean-target clean
 
-clean-iso:
-	rm -f iso/packages/*.vpkg iso/boot/image.gz iso/boot/kernel
+delete: require-root
+	@shopt -u xpg_echo && \
+	echo -n 'Deleting downloaded source code... ' && \
+	(cd platform && ${QMAKE} delete-downloaded) && \
+	echo 'done.'
 
-iso-image: initrd-image verify-packages
-	@echo -n 'Creating ISO image... '
-	@cd iso && mkisofs -J -R -V 'Medic Mobile VM' \
-		-boot-load-size 4 -boot-info-table -o ../output/image.iso \
-		-no-emul-boot -b boot/isolinux/isolinux.bin \
-		-c boot/isolinux/boot.cat . &>/dev/null
-	@echo 'done.'
+download: require-root reset-time prepare-tree
+	@if ! [ -f platform/status/download.finished ]; then \
+	  ${QMAKE} force-download; \
+	fi && \
+	\
+	if ! [ -f platform/status/move.finished ]; then \
+	  ${QMAKE} force-move-downloaded; \
+	fi
 
-initrd-image:
-	@echo -n 'Creating initrd image... '
-	@cd initrd && \
-		find * | cpio -o -H newc 2>/dev/null \
-		  | sh ../source/linux/scripts/xz_wrap.sh \
-			> ../iso/boot/image.xz
-	@echo 'done.'
+# Private targets
 
-strip-binaries:
-	@echo -n "Removing unnecessary symbols... "
-	@./scripts/strip-binaries packages
-	@echo 'done.'
+require-root:
+	@if [ "`id -u`" -ne 0 ]; then \
+	  echo 'Fatal: You must run this build process as root' >&2; \
+	  exit 1; \
+	fi
 
-verify-packages:
-	@echo -n "Verifying package contents... "
-	@./scripts/verify-packages
-	@echo 'done.'
+clean-target:
+	@shopt -u xpg_echo && \
+	echo -n 'Cleaning target directory... ' && \
+	if [ -d /srv ]; then \
+	  cd /srv && rm -rf software settings storage; \
+	fi && \
+	echo 'done.'
 
-concierge-pkg:
-	@echo -n "Compressing package 'concierge'... "
-	@scripts/build-package 'concierge' 1000
-	@echo 'done.'
+clean-initrd:
+	@shopt -u xpg_echo && \
+	echo -n 'Cleaning initrd... ' && \
+	git clean -qf platform/initrd \
+	  platform/initrd/*/lib >/dev/null && \
+	echo 'done.'
 
-java-pkg:
-	@echo -n "Compressing package 'java'... "
-	@scripts/build-package 'java' 1790
-	@echo 'done.'
+reset-time:
+	@shopt -u xpg_echo && \
+	echo -n 'Synchronizing system time... ' && \
+	ntpdate -u pool.ntp.org >/dev/null && \
+	echo 'done.'
 
-medic-core-pkg:
-	@echo -n "Compressing package 'medic-core'... "
-	@scripts/build-package 'medic-core' 1200
-	@echo 'done.'
+prepare-tree:
+	@shopt -u xpg_echo && \
+	echo -n 'Preparing source tree... ' && \
+	./scripts/prepare-tree && \
+	echo 'done.'
 
-system-services-pkg:
-	@echo -n "Compressing package 'system-services'... "
-	@scripts/build-package 'system-services' 1000
-	@echo 'done.'
+force-download:
+	@echo >&2
+	@echo "`tput bold`Retrieving source code`tput sgr0`" >&2 && echo >&2
+	@(cd platform && ${QMAKE} download)
 
-vm-tools-pkg:
-	@echo -n "Compressing package 'vm-tools'... "
-	@scripts/build-package 'vm-tools' 9200
-	@echo 'done.'
-
-shrink-gardener:
-	@./scripts/shrink-gardener
-
-gardener-pkg: shrink-gardener
-	@echo -n "Compressing package 'gardener'... "
-	@scripts/build-package 'gardener' 1000
-	@echo 'done.'
-
-convert-boot-logo:
-	for file in logo-medic logo-medic-gray; do \
-		pngtopnm "kernel/boot-logo/$$file.png" | ppmquant 224 2>/dev/null \
-			| pnmtoplainpnm > "kernel/boot-logo/$$file.ppm"; \
-	done
+force-move-downloaded:
+	@(cd platform && ${QMAKE} move-downloaded)
 

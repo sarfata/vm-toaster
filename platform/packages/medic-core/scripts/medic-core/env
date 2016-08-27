@@ -1,0 +1,35 @@
+#!/bin/sh
+
+merge_environment()
+{
+  local name='medic-core'
+
+  local version='1.6.1'
+  local java_version='1.7.76'
+  local platform="`cat /etc/platform`"
+
+  local prefix="$1"
+  local root="$prefix/software/$name/v$version/$platform"
+  local java_root="$prefix/software/java/v$java_version/$platform"
+
+  export PACKAGE_ROOT="$root"
+  export PACKAGE_NAME="$name"
+  export PACKAGE_VERSION="$version"
+
+  export PACKAGE_SCRIPTS="$prefix/scripts/$name"
+  export PACKAGE_STORAGE="$prefix/storage/$name"
+  export PACKAGE_SOFTWARE="$prefix/software/$name"
+  export PACKAGE_SETTINGS="$prefix/settings/$name"
+
+  export PATH="$root/bin:$root/sbin:$PATH"
+  export LD_LIBRARY_PATH="$root/lib:$LD_LIBRARY_PATH"
+
+  export JAVA_HOME="$java_root"
+  export PATH="$java_root/bin:$java_root/java/bin:$PATH"
+
+  export GAMMU_SMS_DEVICES='/dev/ttyUSB? /dev/ttyACM? /dev/ttyHS?'
+  export CONCIERGE_PASSWD_PATH="$PACKAGE_STORAGE/../concierge/passwd"
+
+  return 0
+}
+

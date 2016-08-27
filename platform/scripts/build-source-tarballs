@@ -1,0 +1,93 @@
+#!/bin/bash
+
+set -o pipefail
+
+self="`readlink -f "$0" 2>/dev/null || realpath "$0"`"
+base_dir="`dirname "$self"`/../.."
+
+fatal()
+{
+  echo "Fatal: $*" >&2
+  exit 255
+}
+
+main()
+{
+  local output_dir="$1"
+  shift 1
+
+  if [ -z "$output_dir" ]; then
+    output_dir="`pwd`"
+  fi
+
+  # Resolve `$base_dir`
+  local top_dir="`
+    readlink -f "$base_dir" 2>/dev/null \
+      || realpath "$base_dir"
+  `"
+
+  # Change to parent of `$top_dir`
+  local cd_dir="`dirname "$top_dir"`"
+  local src_dir="`basename "$top_dir"`"
+
+  cd "$cd_dir" \
+    || fatal "Failed to change directory to '$cd_dir'"
+
+  # Start
+  ts="`date +%Y%m%d`"
+  local platforms='armv6 x86 x64'
+
+  # Clean each platform
+  for platform in $platforms; do
+
+    (cd "$src_dir" && make delete PLATFORM="$platform")
+
+    if [ "$?" -ne 0 ]; then
+      echo 'failed.' >&2
+      warn 'Failed to clean Medic OS source tree'
+    fi
+  done
+
+  # Primary source tree
+  echo -n "Building core Medic OS archive... " >&2 &&
+  \
+  tar -cf - "$src_dir" \
+    --exclude "$src_dir/java" \
+    --exclude "$src_dir/java-current" \
+    --exclude "$src_dir/platform/templates/java" \
+    --exclude "$src_dir/platform/config/aws-current" \
+      | xz -9ec > "medic-os-core-src-$ts.tar.xz"
+
+  if [ "$?" -ne 0 ]; then
+    echo 'failed.' >&2
+    fatal 'Failed to build core Medic OS archive'
+  fi
+  
+  echo 'done.' >&2
+
+  # Platform-specific Java binaries
+  for platform in $platforms; do
+    echo -n "Building JDK/JRE archive for '$platform'... " >&2 &&
+    \
+    (cd "$src_dir/java-current" && \
+      rm -f selected && ln -sf "$platform" selected) && \
+    \
+    tar -cf - "$src_dir/java" \
+      "$src_dir/java-current/selected" \
+      "$src_dir/java-current/$platform" \
+      "$src_dir/platform/templates/java/$platform" \
+        | xz -9ec > "medic-os-java-$platform-$ts.tar.xz"
+
+    if [ "$?" -ne 0 ]; then
+      echo 'failed.' >&2
+      fatal "Failed to build JDK/JRE archive for $platform"
+    fi
+
+    echo 'done.' >&2
+  done
+
+}
+
+main "$@"
+exit "$?"
+
